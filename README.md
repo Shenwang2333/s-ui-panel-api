@@ -76,3 +76,4 @@ Response:
 - The `/api/create` endpoint automatically restarts the s-ui service after creating a user so the sing-box core picks up the new client.
 - All config/inbounds/links fields are stored as BLOBs (required by s-ui's Go backend).
 - The server running this must have read/write access to the s-ui database.
+test push 15:26:46
