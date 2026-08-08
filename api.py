@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
-import json, secrets, sqlite3, uuid, time
+import json, os, secrets, sqlite3, uuid, time
+from urllib.parse import quote
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-DB = "/usr/local/s-ui/db/s-ui.db"
+
+
+def required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+SUI_SERVER_ADDRESS = required_env("SUI_SERVER_ADDRESS")
+SUI_HYSTERIA2_PORT = required_env("SUI_HYSTERIA2_PORT")
+SUI_HYSTERIA2_QUERY = required_env("SUI_HYSTERIA2_QUERY")
+SUI_HYSTERIA2_INBOUND_ID = int(required_env("SUI_HYSTERIA2_INBOUND_ID"))
+SUI_SUBSCRIPTION_REMARK = required_env("SUI_SUBSCRIPTION_REMARK")
+SUI_DB_PATH = required_env("SUI_DB_PATH")
+SUI_API_HOST = required_env("SUI_API_HOST")
+SUI_API_PORT = int(required_env("SUI_API_PORT"))
 
 
 def fmt_bytes(n: int) -> str:
@@ -18,8 +35,8 @@ def fmt_bytes(n: int) -> str:
 
 @app.route("/api/info/<name>")
 def api_info(name):
-    """Get client info by name"""
-    db = sqlite3.connect(DB)
+    """get client info by name"""
+    db = sqlite3.connect(SUI_DB_PATH)
     cur = db.cursor()
     cur.execute(
         "SELECT id, name, volume, expiry, down, up, total_up, total_down, enable "
@@ -49,22 +66,56 @@ def api_info(name):
 
 @app.route("/api/sub/<name>")
 def api_sub(name):
-    """Get subscription link for a client."""
-    db = sqlite3.connect(DB)
+    """get subscription link"""
+    db = sqlite3.connect(SUI_DB_PATH)
     cur = db.cursor()
-    cur.execute("SELECT links FROM clients WHERE name=?", (name,))
-    r = cur.fetchone()
-    db.close()
-    if not r or not r[0]:
+    cur.execute("SELECT links, config FROM clients WHERE name=?", (name,))
+    row = cur.fetchone()
+    if not row:
+        db.close()
         return jsonify({"error": "not found"}), 404
-    links = json.loads(r[0])
-    return jsonify({"uri": links[0]["uri"]})
+
+    links_blob, config_blob = row
+    try:
+        links = json.loads(links_blob or b"[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        links = []
+
+    if isinstance(links, list) and links and isinstance(links[0], dict) and links[0].get("uri"):
+        uri = links[0]["uri"]
+    else:
+        try:
+            config = json.loads(config_blob or b"{}")
+            password = config.get("hysteria2", {}).get("password")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            password = None
+        if not password:
+            db.close()
+            return jsonify({"error": "subscription is not ready"}), 503
+        uri = build_subscription_uri(password)
+        repaired = json.dumps([{
+            "remark": SUI_SUBSCRIPTION_REMARK,
+            "type": "local",
+            "uri": uri,
+        }]).encode()
+        cur.execute("UPDATE clients SET links=? WHERE name=?", (sqlite3.Binary(repaired), name))
+        db.commit()
+
+    db.close()
+    return jsonify({"uri": uri})
+
+
+def build_subscription_uri(password):
+    return (
+        f"hysteria2://{password}@{SUI_SERVER_ADDRESS}:{SUI_HYSTERIA2_PORT}?"
+        f"{SUI_HYSTERIA2_QUERY}#{quote(SUI_SUBSCRIPTION_REMARK)}"
+    )
 
 
 @app.route("/api/clients")
 def api_clients():
-    """List all enabled client names."""
-    db = sqlite3.connect(DB)
+    """list all enabled client"""
+    db = sqlite3.connect(SUI_DB_PATH)
     cur = db.cursor()
     cur.execute("SELECT name FROM clients WHERE enable=1 AND name GLOB '[0-9]*'")
     names = [r[0] for r in cur.fetchall()]
@@ -74,8 +125,8 @@ def api_clients():
 
 @app.route("/api/stats")
 def api_stats():
-    """Get online user count and total traffic volume."""
-    db = sqlite3.connect(DB)
+    """online users | total traffic volume | registered user count"""
+    db = sqlite3.connect(SUI_DB_PATH)
     cur = db.cursor()
     cutoff = int(time.time()) - 300
     cur.execute(
@@ -85,19 +136,25 @@ def api_stats():
     cur.execute("SELECT SUM(down), SUM(up) FROM clients WHERE enable=1")
     r = cur.fetchone()
     total_bytes = (r[0] or 0) + (r[1] or 0)
+    cur.execute("SELECT COUNT(*) FROM clients")
+    registrations = cur.fetchone()[0]
     db.close()
-    return jsonify({"online": online, "total_bytes": total_bytes})
+    return jsonify({
+        "online": online,
+        "total_bytes": total_bytes,
+        "registrations": registrations,
+    })
 
 
 @app.route("/api/create", methods=["POST"])
 def api_create():
-    """Create a new VPN client. Auto-restarts s-ui after creation."""
+    """create a new user(client)"""
     data = request.json
     name = data.get("name", "")
     if not name:
         return jsonify({"error": "name required"}), 400
 
-    db = sqlite3.connect(DB)
+    db = sqlite3.connect(SUI_DB_PATH)
     cur = db.cursor()
     cur.execute("SELECT id FROM clients WHERE name=?", (name,))
     if cur.fetchone():
@@ -130,14 +187,9 @@ def api_create():
         }
     )
 
-    uri = (
-        f"hysteria2://{pw}@131.143.215.72:443"
-        f"?security=tls&insecure=1&sni=bing.com"
-        f"&alpn=h3,h2,http/1.1&fastopen=0"
-        f"#sw.cc%20network%20%7C%20hysteria2"
-    )
+    uri = build_subscription_uri(pw)
     lnk = json.dumps(
-        [{"remark": "sw.cc network | hysteria2", "type": "local", "uri": uri}]
+        [{"remark": SUI_SUBSCRIPTION_REMARK, "type": "local", "uri": uri}]
     )
 
     cur.execute(
@@ -146,7 +198,7 @@ def api_create():
         (
             name,
             sqlite3.Binary(cfg.encode()),
-            sqlite3.Binary(json.dumps([6]).encode()),
+            sqlite3.Binary(json.dumps([SUI_HYSTERIA2_INBOUND_ID]).encode()),
             sqlite3.Binary(lnk.encode()),
         ),
     )
@@ -167,4 +219,4 @@ def api_create():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8891)
+    app.run(host=SUI_API_HOST, port=SUI_API_PORT)
