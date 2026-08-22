@@ -6,7 +6,7 @@ REST API for managing VPN users through the [s-ui](https://github.com/alireza0/s
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/create` | Create a new VPN user |
+| POST | `/api/create` | Create a new VPN user in the `user` group |
 | GET | `/api/info/<name>` | Get user info and traffic stats |
 | GET | `/api/traffic/<name>?hours=168` | Get hourly traffic for up to seven days |
 | GET | `/api/sub/<name>` | Get user subscription link |
@@ -43,6 +43,10 @@ SUI_DB_PATH=/path/to/s-ui.db
 SUI_API_HOST=127.0.0.1
 SUI_API_PORT=your-api-port
 SUI_ADMIN_TOKEN=generate-a-random-secret
+SUI_PANEL_API_URL=https://your-panel.example.com:your-panel-port/your-panel-path/apiv2/onlines
+SUI_PANEL_API_TOKEN=generate-an-s-ui-api-token
+SUI_PANEL_CONNECT_HOST=127.0.0.1
+SUI_PANEL_CA_FILE=/path/to/panel-origin-ca.pem
 ```
 
 The variables are used as follows:
@@ -62,6 +66,10 @@ The variables are used as follows:
 - `SUI_API_HOST`: address on which this API listens.
 - `SUI_API_PORT`: port on which this API listens.
 - `SUI_ADMIN_TOKEN`: secret Bearer token accepted only by the ban and restore endpoints.
+- `SUI_PANEL_API_URL`: S-UI API v2 `onlines` endpoint, including its TLS hostname.
+- `SUI_PANEL_API_TOKEN`: S-UI API token sent only to the local panel endpoint.
+- `SUI_PANEL_CONNECT_HOST`: local address used for the panel connection while preserving TLS SNI.
+- `SUI_PANEL_CA_FILE`: CA certificate used to verify the panel's TLS certificate.
 
 Generate the management token on the server and keep the environment file restricted:
 
@@ -179,8 +187,10 @@ curl -X POST \
 - The `/api/create` endpoint automatically restarts the s-ui service after creating a user so the sing-box core picks up the new client.
 - All config/inbounds/links fields are stored as BLOBs (required by s-ui's Go backend).
 - `/api/sub/<name>` repairs a missing or malformed `links` field from the stored Hysteria 2 password and writes it back as a BLOB. This prevents new accounts from returning a subscription error while s-ui is reloading.
-- New users receive Hysteria 2, SOCKS, and VMess links and are assigned to all three configured inbounds.
+- `/api/sub/<name>` also repairs stored SOCKS links that still point at an old or proxied hostname, using `SUI_SOCKS_SERVER` and `SUI_SOCKS_PORT`.
+- New users are assigned to the S-UI `user` group, receive Hysteria 2, SOCKS, and VMess links, and are assigned to all three configured inbounds.
+- SOCKS links use the broadly supported `socks5://username:password@host:port` URI format; the SOCKS endpoint must resolve directly to the server and cannot use a Cloudflare-proxied hostname.
 - `/api/ban` and `/api/restore` require the `SUI_ADMIN_TOKEN`; never expose this token to clients or commit it.
-- Active-user statistics count unique users with actual traffic during the last five minutes.
+- Online-user statistics use S-UI's live in-memory `onlines.user` list rather than a traffic time window.
 - `registrations` is the total row count in the `clients` table, including disabled clients.
 - The server running this must have read/write access to the s-ui database.

