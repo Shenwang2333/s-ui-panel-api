@@ -185,6 +185,7 @@ curl -X POST \
 ## Notes
 
 - The `/api/create` endpoint automatically restarts the s-ui service after creating a user so the sing-box core picks up the new client.
+- `/api/create` retries transient SQLite write locks caused by S-UI traffic updates and returns HTTP 503 if the database remains busy.
 - All config/inbounds/links fields are stored as BLOBs (required by s-ui's Go backend).
 - `/api/sub/<name>` repairs a missing or malformed `links` field from the stored Hysteria 2 password and writes it back as a BLOB. This prevents new accounts from returning a subscription error while s-ui is reloading.
 - `/api/sub/<name>` also repairs stored SOCKS links that still point at an old or proxied hostname, using `SUI_SOCKS_SERVER` and `SUI_SOCKS_PORT`.
