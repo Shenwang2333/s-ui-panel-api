@@ -21,11 +21,37 @@ store or know the randomized client name.
 | POST | `/api/reset/<discord_id>` | Rotate the random name and all protocol credentials |
 | POST | `/api/ban/<discord_id>` | Disable a user and assign the `banned` group |
 | POST | `/api/restore/<discord_id>` | Restore state after a paired Discord ban fails |
+| GET | `/api/nodes/<node_id>/config` | Return enabled credentials to one authenticated edge node |
 | POST | `/api/reload` | Restart S-UI asynchronously; internal use only |
 
-`/api/reset`, `/api/ban`, and `/api/restore` require the management Bearer
-token. Other management routes should remain on a trusted network or behind a
-separately authenticated reverse proxy.
+Every `/api/...` endpoint requires a Bearer token. Management endpoints use
+`SUI_ADMIN_TOKEN`; `/api/nodes/<node_id>/config` uses the separate
+`SUI_EDGE_NODE_TOKEN`. The edge token is intentionally restricted to the node
+configuration endpoint and cannot read users, subscriptions, statistics, or
+perform management actions. Requests without the correct token return HTTP
+401. The production API is exposed at `https://api.swangnetwork.asia`.
+
+## Architecture
+
+The S-UI database on the control-plane server is the only source of truth.
+Edge nodes do not mount, copy, or directly open that SQLite database. Instead,
+`edge_agent.py` polls the authenticated node configuration endpoint, validates
+the returned client names and credentials, builds a complete sing-box config,
+runs `sing-box check`, and atomically replaces the active config only when it
+changes.
+
+Each subscription contains five links in this order:
+
+1. Control-plane Hysteria2 over direct DNS with a public TLS certificate.
+2. Control-plane SOCKS over a direct address.
+3. Control-plane VMess WebSocket through its CDN hostname.
+4. Edge-node Hysteria2 over direct DNS with its own public TLS certificate.
+5. Edge-node VMess WebSocket through the edge CDN hostname.
+
+Hysteria2 hostnames must be DNS-only and must not be proxied by a CDN. VMess
+uses a separate CDN-proxied hostname and WebSocket path. A reset rotates the
+credentials used by both servers; a ban removes the user from the edge payload.
+The edge applies either change on its next poll without sharing SQLite files.
 
 ## Configuration
 
@@ -59,6 +85,16 @@ SUI_PANEL_API_URL=https://your-panel.example.com:your-panel-port/your-panel-path
 SUI_PANEL_API_TOKEN=generate-an-s-ui-api-token
 SUI_PANEL_CONNECT_HOST=127.0.0.1
 SUI_PANEL_CA_FILE=/path/to/panel-origin-ca.pem
+SUI_EDGE_NODE_ID=your-edge-node-id
+SUI_EDGE_NODE_TOKEN=generate-a-separate-random-secret
+SUI_EDGE_HYSTERIA2_SERVER=your-edge-hysteria-host.example.com
+SUI_EDGE_HYSTERIA2_PORT=8443
+SUI_EDGE_HYSTERIA2_QUERY="security=tls&insecure=0&sni=your-edge-hysteria-host.example.com&alpn=h3&fastopen=0"
+SUI_EDGE_HYSTERIA2_REMARK="your-edge-hysteria-node-name"
+SUI_EDGE_VMESS_SERVER=your-edge-cdn-host.example.com
+SUI_EDGE_VMESS_PORT=8443
+SUI_EDGE_VMESS_PATH=/your-websocket-path
+SUI_EDGE_VMESS_REMARK="your-edge-vmess-node-name"
 ```
 
 The variables are used as follows:
@@ -77,11 +113,15 @@ The variables are used as follows:
 - `SUI_DB_PATH`: path to the S-UI SQLite database.
 - `SUI_API_HOST`: address on which this API listens.
 - `SUI_API_PORT`: port on which this API listens.
-- `SUI_ADMIN_TOKEN`: secret Bearer token accepted by the reset, ban, and restore endpoints.
+- `SUI_ADMIN_TOKEN`: secret Bearer token required by every management API endpoint.
 - `SUI_PANEL_API_URL`: S-UI API v2 `onlines` endpoint, including its TLS hostname.
 - `SUI_PANEL_API_TOKEN`: S-UI API token sent only to the local panel endpoint.
 - `SUI_PANEL_CONNECT_HOST`: local address used for the panel connection while preserving TLS SNI.
 - `SUI_PANEL_CA_FILE`: CA certificate used to verify the panel's TLS certificate.
+- `SUI_EDGE_NODE_ID`: identifier accepted in the edge-node API path.
+- `SUI_EDGE_NODE_TOKEN`: independent Bearer token used only by the edge agent.
+- `SUI_EDGE_HYSTERIA2_*`: direct edge Hysteria2 endpoint, TLS query, and remark.
+- `SUI_EDGE_VMESS_*`: CDN edge VMess hostname, port, WebSocket path, and remark.
 
 Generate the management token on the server and keep the environment file restricted:
 
@@ -106,6 +146,80 @@ systemctl daemon-reload
 systemctl restart sui-api-receiver
 ```
 
+`deploy/sui-api.env.example` contains the complete environment template. Keep
+the production copy outside the repository with mode `0600`.
+
+## Edge Deployment
+
+Install sing-box and copy the deployment files to the edge node:
+
+```bash
+install -d -m 755 /usr/local/lib/sui-edge-agent
+install -d -m 750 -o root -g sing-box /etc/sing-box /etc/sing-box/certs
+install -m 755 edge_agent.py /usr/local/lib/sui-edge-agent/edge_agent.py
+install -m 644 deploy/sing-box.service /etc/systemd/system/sing-box.service
+install -m 644 deploy/sui-edge-agent.service /etc/systemd/system/sui-edge-agent.service
+install -m 600 deploy/sui-edge-agent.env.example /etc/sui-edge-agent.env
+```
+
+Create a separate random node token on the control plane, place the same value
+in `SUI_EDGE_NODE_TOKEN`, and write it to the edge token file with mode `0600`.
+Do not reuse the management or Discord token. The optional legacy users file
+can temporarily retain an existing Hysteria2-only service account during a
+migration; it is runtime state and must not be committed.
+
+Before switching the production port, validate the fetched configuration on a
+temporary listener:
+
+```bash
+set -a
+. /etc/sui-edge-agent.env
+set +a
+HYSTERIA2_LISTEN_PORT=4443 \
+  python3 /usr/local/lib/sui-edge-agent/edge_agent.py --check
+```
+
+The Agent prefers IPv4 when the API hostname has both A and AAAA records, then
+falls back to IPv6. This avoids synchronization delays on hosts with published
+but unusable IPv6 connectivity. Enable both services only after `--check`
+succeeds.
+
+```bash
+systemctl daemon-reload
+systemctl enable sing-box sui-edge-agent
+systemctl start sui-edge-agent
+```
+
+The edge Nginx virtual host should terminate CDN HTTPS and proxy only the
+configured WebSocket path to the loopback VMess listener. Its TCP 443 listener
+can coexist with Hysteria2 on UDP 443.
+
+## Certificates and Stored Links
+
+Use independent publicly trusted certificates for each direct Hysteria2
+hostname. Customize the certificate-name placeholders in both deploy hooks
+before installing them under `/etc/letsencrypt/renewal-hooks/deploy/`.
+
+- `certbot-sing-box-hook` copies the renewed edge certificate with restricted
+  ownership and restarts sing-box only if it is already running.
+- `certbot-sui-hysteria2-hook` updates only the configured S-UI Hysteria2 TLS
+  record, stores JSON as SQLite BLOBs, creates a backup under
+  `/var/backups/s-ui-cert-renewal`, and restarts S-UI.
+
+After adding or changing a node, rebuild every existing client's stored links:
+
+```bash
+python3 deploy/rebuild_subscription_links.py \
+  --environment-file /etc/sui-api.env \
+  --api /root/receiver.py \
+  --database /usr/local/s-ui/db/s-ui.db
+```
+
+The rebuild command creates a SQLite backup under
+`/var/backups/sui-api-links` before writing changes. It reads the systemd
+EnvironmentFile directly, so remarks containing spaces do not need to be
+shell-compatible.
+
 ## Usage
 
 ```bash
@@ -128,15 +242,16 @@ column. For compatibility, `name` is still accepted as an alias for
 
 ```bash
 curl -X POST "http://${SUI_API_HOST}:${SUI_API_PORT}/api/create" \
+  -H "Authorization: Bearer ${SUI_ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
-  -d '{"discord_id":"1096824314973663273","description":"discord_username"}'
+  -d '{"discord_id":"123456789012345678","description":"discord_username"}'
 ```
 
 Response:
 ```json
 {
   "id": 42,
-  "discord_id": "1096824314973663273",
+  "discord_id": "123456789012345678",
   "name": "k7v2m9a4q1x8c6bz",
   "links": "hysteria2://password@server:443?..."
 }
@@ -155,7 +270,8 @@ returns the existing random name without creating another client:
 ### Get User Info
 
 ```bash
-curl "http://${SUI_API_HOST}:${SUI_API_PORT}/api/info/1096824314973663273"
+curl "https://api.swangnetwork.asia/api/info/123456789012345678" \
+  -H "Authorization: Bearer ${SUI_ADMIN_TOKEN}"
 ```
 
 The response includes the internal random `name`, the external `discord_id`,
@@ -165,7 +281,8 @@ traffic totals.
 ### Get Subscription Link
 
 ```bash
-curl "http://${SUI_API_HOST}:${SUI_API_PORT}/api/sub/1096824314973663273"
+curl "https://api.swangnetwork.asia/api/sub/123456789012345678" \
+  -H "Authorization: Bearer ${SUI_ADMIN_TOKEN}"
 ```
 
 Response:
@@ -183,13 +300,15 @@ user identifier and do not expose it separately from the subscription link.
 ### Get Traffic History
 
 ```bash
-curl "http://${SUI_API_HOST}:${SUI_API_PORT}/api/traffic/1096824314973663273?hours=168"
+curl "https://api.swangnetwork.asia/api/traffic/123456789012345678?hours=168" \
+  -H "Authorization: Bearer ${SUI_ADMIN_TOKEN}"
 ```
 
 ### Get Stats
 
 ```bash
-curl "http://${SUI_API_HOST}:${SUI_API_PORT}/api/stats"
+curl "https://api.swangnetwork.asia/api/stats" \
+  -H "Authorization: Bearer ${SUI_ADMIN_TOKEN}"
 ```
 
 Response:
@@ -215,7 +334,7 @@ preserved.
 
 ```bash
 curl -X POST \
-  "http://${SUI_API_HOST}:${SUI_API_PORT}/api/reset/1096824314973663273" \
+  "http://${SUI_API_HOST}:${SUI_API_PORT}/api/reset/123456789012345678" \
   -H "Authorization: Bearer ${SUI_ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"description":"discord_username"}'
@@ -225,7 +344,7 @@ Response:
 
 ```json
 {
-  "discord_id": "1096824314973663273",
+  "discord_id": "123456789012345678",
   "old_name": "k7v2m9a4q1x8c6bz",
   "name": "p3n8r5w1d9f6h2jt"
 }
@@ -238,7 +357,7 @@ the S-UI group `banned`, and restarts S-UI so sing-box drops the client.
 
 ```bash
 curl -X POST \
-  "http://${SUI_API_HOST}:${SUI_API_PORT}/api/ban/1096824314973663273" \
+  "http://${SUI_API_HOST}:${SUI_API_PORT}/api/ban/123456789012345678" \
   -H "Authorization: Bearer ${SUI_ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"reason":"Subscription sharing"}'
@@ -251,7 +370,7 @@ restore endpoint if the Discord operation fails:
 
 ```bash
 curl -X POST \
-  "http://${SUI_API_HOST}:${SUI_API_PORT}/api/restore/1096824314973663273" \
+  "http://${SUI_API_HOST}:${SUI_API_PORT}/api/restore/123456789012345678" \
   -H "Authorization: Bearer ${SUI_ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"enabled":true,"group":"user","desc":"discord_username"}'
@@ -314,13 +433,18 @@ fail, and a mapped `/api/sub/<discord_id>` request succeeds.
 - The `/api/create` endpoint automatically restarts the s-ui service after creating a user so the sing-box core picks up the new client.
 - `/api/create` retries transient SQLite write locks caused by S-UI traffic updates and returns HTTP 503 if the database remains busy.
 - `/api/create` is idempotent by Discord ID and stores a random 16-character lowercase alphanumeric value in `clients.name`.
+- `/api/create` replaces a stale Discord mapping when its referenced S-UI
+  client row no longer exists. Valid bans keep their client row and therefore
+  remain protected by the normal idempotency check.
 - All config/inbounds/links fields are stored as BLOBs (required by s-ui's Go backend).
 - `/api/sub/<discord_id>` repairs a missing or malformed `links` field from stored credentials and writes it back as a BLOB. This prevents new accounts from returning a subscription error while S-UI is reloading.
 - `/api/sub/<discord_id>` also repairs stored SOCKS links that still point at an old or proxied hostname, using `SUI_SOCKS_SERVER` and `SUI_SOCKS_PORT`.
 - `/api/reset/<discord_id>` rotates the internal name and every generated protocol credential; callers must discard all previously returned links.
-- New users are assigned to the S-UI `user` group, receive Hysteria 2, SOCKS, and VMess links, and are assigned to all three configured inbounds.
+- New users are assigned to the S-UI `user` group, receive five aggregated links, and are assigned to the three configured control-plane inbounds.
 - SOCKS links use the broadly supported `socks5://username:password@host:port` URI format; the SOCKS endpoint must resolve directly to the server and cannot use a Cloudflare-proxied hostname.
-- `/api/reset`, `/api/ban`, and `/api/restore` require the `SUI_ADMIN_TOKEN`; never expose this token to clients or commit it.
+- Every `/api/...` endpoint requires the `SUI_ADMIN_TOKEN`, except
+  `/api/nodes/<node_id>/config`, which requires only the separate
+  `SUI_EDGE_NODE_TOKEN`; never expose either token to clients or commit them.
 - Online-user statistics use S-UI's live in-memory `onlines.user` list rather than a traffic time window.
 - `registrations` is the total row count in the `clients` table, including disabled clients.
 - The server running this must have read/write access to the s-ui database.

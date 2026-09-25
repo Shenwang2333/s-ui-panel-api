@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -53,6 +54,16 @@ SUI_PANEL_API_URL = required_env("SUI_PANEL_API_URL")
 SUI_PANEL_API_TOKEN = required_env("SUI_PANEL_API_TOKEN")
 SUI_PANEL_CONNECT_HOST = required_env("SUI_PANEL_CONNECT_HOST")
 SUI_PANEL_CA_FILE = required_env("SUI_PANEL_CA_FILE")
+SUI_EDGE_NODE_ID = required_env("SUI_EDGE_NODE_ID")
+SUI_EDGE_NODE_TOKEN = required_env("SUI_EDGE_NODE_TOKEN")
+SUI_EDGE_HYSTERIA2_SERVER = required_env("SUI_EDGE_HYSTERIA2_SERVER")
+SUI_EDGE_HYSTERIA2_PORT = int(required_env("SUI_EDGE_HYSTERIA2_PORT"))
+SUI_EDGE_HYSTERIA2_QUERY = required_env("SUI_EDGE_HYSTERIA2_QUERY")
+SUI_EDGE_HYSTERIA2_REMARK = required_env("SUI_EDGE_HYSTERIA2_REMARK")
+SUI_EDGE_VMESS_SERVER = required_env("SUI_EDGE_VMESS_SERVER")
+SUI_EDGE_VMESS_PORT = int(required_env("SUI_EDGE_VMESS_PORT"))
+SUI_EDGE_VMESS_PATH = required_env("SUI_EDGE_VMESS_PATH")
+SUI_EDGE_VMESS_REMARK = required_env("SUI_EDGE_VMESS_REMARK")
 
 TRAFFIC_HISTORY_HOURS = 24 * 7
 SQLITE_WRITE_RETRIES = 6
@@ -216,6 +227,29 @@ def admin_authorized() -> bool:
     return secrets.compare_digest(supplied_token, f"Bearer {SUI_ADMIN_TOKEN}")
 
 
+def edge_node_authorized() -> bool:
+    supplied_token = request.headers.get("Authorization", "")
+    return secrets.compare_digest(
+        supplied_token, f"Bearer {SUI_EDGE_NODE_TOKEN}"
+    )
+
+
+@app.before_request
+def authorize_api_request():
+    """Require the correctly scoped Bearer token for every API route."""
+    if not request.path.startswith("/api/"):
+        return None
+
+    if request.path.startswith("/api/nodes/"):
+        authorized = edge_node_authorized()
+    else:
+        authorized = admin_authorized()
+
+    if not authorized:
+        return jsonify({"error": "unauthorized"}), 401
+    return None
+
+
 class LocalAddressHTTPSConnection(http.client.HTTPSConnection):
     """Connect locally while preserving the panel hostname for TLS SNI."""
 
@@ -333,7 +367,21 @@ def insert_client_record(
                     "SELECT client_name FROM discord_users WHERE discord_id=?",
                     (discord_id,),
                 ).fetchone()
-                if mapped or db.execute(
+                if mapped:
+                    mapped_client = db.execute(
+                        "SELECT id FROM clients WHERE name=?", (mapped[0],)
+                    ).fetchone()
+                    if mapped_client:
+                        return None
+                    # Repair a stale identity mapping whose S-UI client row was
+                    # deleted. A valid ban always retains its client row with
+                    # enable=0 and group=banned, so mapping metadata alone must
+                    # not prevent recovery.
+                    db.execute(
+                        "DELETE FROM discord_users WHERE discord_id=?",
+                        (discord_id,),
+                    )
+                if db.execute(
                     "SELECT id FROM clients WHERE name=?", (discord_id,)
                 ).fetchone():
                     return None
@@ -359,39 +407,63 @@ def insert_client_record(
     raise RuntimeError("unreachable")
 
 
-def build_subscription_uri(password: str) -> str:
+def build_hysteria2_uri(
+    password: str,
+    server: str,
+    port: int | str,
+    query: str,
+    remark: str,
+) -> str:
     return (
-        f"hysteria2://{password}@{SUI_SERVER_ADDRESS}:{SUI_HYSTERIA2_PORT}?"
-        f"{SUI_HYSTERIA2_QUERY}#{quote(SUI_SUBSCRIPTION_REMARK)}"
+        f"hysteria2://{password}@{server}:{port}?{query}#{quote(remark)}"
     )
 
 
-def build_subscription_links(name: str, config: dict) -> list[dict]:
-    """Build Hysteria 2, SOCKS, and VMess links from stored credentials."""
-    hysteria_password = config["hysteria2"]["password"]
-    socks = config["socks"]
-    vmess = config["vmess"]
-    socks_username = quote(str(socks["username"]), safe="")
-    socks_password = quote(str(socks["password"]), safe="")
-    vmess_payload = {
+def build_subscription_uri(password: str) -> str:
+    return build_hysteria2_uri(
+        password,
+        SUI_SERVER_ADDRESS,
+        SUI_HYSTERIA2_PORT,
+        SUI_HYSTERIA2_QUERY,
+        SUI_SUBSCRIPTION_REMARK,
+    )
+
+
+def build_vmess_uri(
+    vmess: dict,
+    server: str,
+    port: int,
+    path: str,
+    remark: str,
+) -> str:
+    payload = {
         "v": "2",
-        "ps": SUI_VMESS_REMARK,
-        "add": SUI_VMESS_SERVER,
-        "port": str(SUI_VMESS_PORT),
+        "ps": remark,
+        "add": server,
+        "port": str(port),
         "id": vmess["uuid"],
         "aid": str(vmess.get("alterId", 0)),
         "scy": "auto",
         "net": "ws",
         "type": "none",
-        "host": SUI_VMESS_SERVER,
-        "path": SUI_VMESS_PATH,
+        "host": server,
+        "path": path,
         "tls": "tls",
-        "sni": SUI_VMESS_SERVER,
+        "sni": server,
         "fp": "chrome",
     }
-    vmess_uri = "vmess://" + base64.b64encode(
-        json.dumps(vmess_payload, separators=(",", ":")).encode()
+    return "vmess://" + base64.b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()
     ).decode()
+
+
+def build_subscription_links(name: str, config: dict) -> list[dict]:
+    """Build links for local S-UI services and the managed edge node."""
+    hysteria_password = config["hysteria2"]["password"]
+    socks = config["socks"]
+    vmess = config["vmess"]
+    socks_username = quote(str(socks["username"]), safe="")
+    socks_password = quote(str(socks["password"]), safe="")
     return [
         {
             "remark": SUI_SUBSCRIPTION_REMARK,
@@ -409,7 +481,35 @@ def build_subscription_links(name: str, config: dict) -> list[dict]:
         {
             "remark": SUI_VMESS_REMARK,
             "type": "local",
-            "uri": vmess_uri,
+            "uri": build_vmess_uri(
+                vmess,
+                SUI_VMESS_SERVER,
+                SUI_VMESS_PORT,
+                SUI_VMESS_PATH,
+                SUI_VMESS_REMARK,
+            ),
+        },
+        {
+            "remark": SUI_EDGE_HYSTERIA2_REMARK,
+            "type": "external",
+            "uri": build_hysteria2_uri(
+                hysteria_password,
+                SUI_EDGE_HYSTERIA2_SERVER,
+                SUI_EDGE_HYSTERIA2_PORT,
+                SUI_EDGE_HYSTERIA2_QUERY,
+                SUI_EDGE_HYSTERIA2_REMARK,
+            ),
+        },
+        {
+            "remark": SUI_EDGE_VMESS_REMARK,
+            "type": "external",
+            "uri": build_vmess_uri(
+                vmess,
+                SUI_EDGE_VMESS_SERVER,
+                SUI_EDGE_VMESS_PORT,
+                SUI_EDGE_VMESS_PATH,
+                SUI_EDGE_VMESS_REMARK,
+            ),
         },
     ]
 
@@ -538,7 +638,7 @@ def api_traffic(name):
 
 @app.route("/api/sub/<name>")
 def api_sub(name):
-    """Get subscription links, repairing a missing links field when possible."""
+    """Get a subscription URI and keep all node links synchronized."""
     db = open_api_db()
     client_name = resolve_client_name(name, db)
     row = db.execute(
@@ -554,22 +654,16 @@ def api_sub(name):
     except (TypeError, ValueError, json.JSONDecodeError):
         links = []
 
-    if (
-        isinstance(links, list)
-        and links
-        and isinstance(links[0], dict)
-        and links[0].get("uri")
-        and has_current_socks_link(links)
-    ):
-        uri = links[0]["uri"]
-    else:
-        try:
-            config = json.loads(config_blob or b"{}")
-            links = build_subscription_links(client_name, config)
-            uri = links[0]["uri"]
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            db.close()
-            return jsonify({"error": "subscription is not ready"}), 503
+    try:
+        config = json.loads(config_blob or b"{}")
+        expected_links = build_subscription_links(client_name, config)
+        uri = expected_links[0]["uri"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        db.close()
+        return jsonify({"error": "subscription is not ready"}), 503
+
+    if links != expected_links:
+        links = expected_links
         repaired = json.dumps(links).encode()
         db.execute(
             "UPDATE clients SET links=? WHERE name=?",
@@ -579,6 +673,50 @@ def api_sub(name):
 
     db.close()
     return jsonify({"uri": uri, "name": client_name})
+
+
+@app.route("/api/nodes/<node_id>/config")
+def api_node_config(node_id):
+    """Return enabled protocol credentials to one authenticated edge node."""
+    if node_id != SUI_EDGE_NODE_ID:
+        return jsonify({"error": "not found"}), 404
+    if not edge_node_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    clients = []
+    with open_api_db() as db:
+        rows = db.execute(
+            'SELECT name, config FROM clients WHERE enable=1 '
+            'AND COALESCE("group", "") != ? '
+            "ORDER BY name",
+            ("banned",),
+        ).fetchall()
+    try:
+        for name, config_blob in rows:
+            config = json.loads(config_blob or b"{}")
+            clients.append(
+                {
+                    "name": name,
+                    "hysteria2_password": config["hysteria2"]["password"],
+                    "vmess_uuid": config["vmess"]["uuid"],
+                }
+            )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        app.logger.exception("Could not build edge-node configuration")
+        return jsonify({"error": "node configuration is not ready"}), 503
+
+    serialized = json.dumps(
+        clients, sort_keys=True, separators=(",", ":")
+    ).encode()
+    response = jsonify(
+        {
+            "node_id": node_id,
+            "version": hashlib.sha256(serialized).hexdigest(),
+            "clients": clients,
+        }
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/api/reload", methods=["POST"])

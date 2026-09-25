@@ -1,0 +1,23 @@
+[Unit]
+Description=sing-box managed edge node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sing-box
+Group=sing-box
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/sing-box
+ReadWritePaths=/var/lib/sing-box
+
+[Install]
+WantedBy=multi-user.target

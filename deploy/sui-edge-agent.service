@@ -1,0 +1,15 @@
+[Unit]
+Description=S-UI sing-box edge synchronization agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/sui-edge-agent.env
+ExecStart=/usr/bin/python3 -u /usr/local/lib/sui-edge-agent/edge_agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

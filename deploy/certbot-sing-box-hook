@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+CERTIFICATE_NAME=your-edge-hysteria-host.example.com
+LINEAGE=/etc/letsencrypt/live/$CERTIFICATE_NAME
+
+if [ -n "${RENEWED_LINEAGE:-}" ] && [ "$RENEWED_LINEAGE" != "$LINEAGE" ]; then
+    exit 0
+fi
+
+install -o root -g sing-box -m 0644 \
+    "$LINEAGE/fullchain.pem" \
+    /etc/sing-box/certs/fullchain.pem
+install -o root -g sing-box -m 0640 \
+    "$LINEAGE/privkey.pem" \
+    /etc/sing-box/certs/privkey.pem
+systemctl try-restart sing-box.service

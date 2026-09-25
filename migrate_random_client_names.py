@@ -26,7 +26,7 @@ def fetch_discord_tag(discord_id: str, token: str) -> str:
         f"https://discord.com/api/v10/users/{discord_id}",
         headers={
             "Authorization": f"Bot {token}",
-            "User-Agent": "DiscordBot (https://bot.swangnetwork.asia, 1.0)",
+            "User-Agent": "DiscordBot (s-ui-migration, 1.0)",
         },
     )
     try:

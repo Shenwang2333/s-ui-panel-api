@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+CERTIFICATE_NAME=your-control-plane-hysteria-host.example.com
+LINEAGE=/etc/letsencrypt/live/$CERTIFICATE_NAME
+if [ -n "${RENEWED_LINEAGE:-}" ] && [ "$RENEWED_LINEAGE" != "$LINEAGE" ]; then
+    exit 0
+fi
+
+/usr/bin/python3 /usr/local/lib/sui-api/update_hysteria2_tls.py \
+    --database /usr/local/s-ui/db/s-ui.db \
+    --certificate "$LINEAGE/fullchain.pem" \
+    --private-key "$LINEAGE/privkey.pem" \
+    --server-name "$CERTIFICATE_NAME" \
+    --tls-id 4
+systemctl restart s-ui.service
+systemctl is-active --quiet s-ui.service
